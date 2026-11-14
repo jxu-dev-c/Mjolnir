@@ -1,0 +1,72 @@
+#!/bin/bash
+# Builds Mjolnir (this fork of herdr-app) for Apple Silicon and assembles
+# dist/Mjolnir.app for the Homebrew cask (.github/workflows/homebrew-release.yml).
+#
+#   VERSION=0.1.15-mjolnir.1 scripts/mjolnir-package
+#
+# Optional environment:
+#   SIGN_IDENTITY="Mjolnir Release"   sign with this identity; fails if it isn't
+#                                     in the keychain. Unset: ad hoc.
+#
+# Unlike scripts/package, this does NOT set HERDR_APP_RELEASE: that flag makes
+# the app replace itself with upstream Herdr from releases.herdr.dev and send
+# telemetry to upstream. Homebrew owns Mjolnir's updates. The core still
+# installs itself on first start; `hc update` updates it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+VERSION="${VERSION:?set VERSION, e.g. VERSION=0.1.15-mjolnir.1}"
+BUNDLE_ID=com.jasonxu.mjolnir
+
+[[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || { echo "mjolnir-package: needs an Apple Silicon Mac" >&2; exit 1; }
+for notice in LICENSE THIRD-PARTY-NOTICES; do
+  [[ -s $notice ]] || { echo "mjolnir-package: $notice is missing or empty" >&2; exit 1; }
+done
+
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  security find-identity -p codesigning 2>/dev/null | grep -q "\"$SIGN_IDENTITY\"" \
+    || { echo "mjolnir-package: signing identity \"$SIGN_IDENTITY\" not found" >&2; exit 1; }
+  identity="$SIGN_IDENTITY"
+else
+  identity=-
+fi
+
+env -u HERDR_APP_RELEASE cargo build --release --locked
+
+app=dist/Mjolnir.app
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp target/release/herdr-app "$app/Contents/MacOS/Mjolnir"
+cp assets/icons/Herdr.icns "$app/Contents/Resources/Mjolnir.icns"
+cp LICENSE THIRD-PARTY-NOTICES "$app/Contents/Resources/"
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>Mjolnir</string>
+    <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+    <key>CFBundleName</key><string>Mjolnir</string>
+    <key>CFBundleDisplayName</key><string>Mjolnir</string>
+    <key>CFBundleIconFile</key><string>Mjolnir</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Mjolnir can use the microphone, for example for voice input.</string>
+    <key>NSCameraUsageDescription</key><string>Terminal programs running in Mjolnir can use the camera.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Mjolnir can use AppleScript to control other apps.</string>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>LSEnvironment</key><dict/></dict></plist>
+PLIST
+plutil -lint "$app/Contents/Info.plist" >/dev/null
+for notice in LICENSE THIRD-PARTY-NOTICES; do
+  cmp "$app/Contents/Resources/$notice" "$notice"
+done
+
+# No hardened runtime: QuickJS uses MAP_JIT, which hardened runtime blocks
+# without entitlements. A stable identity keeps macOS permission grants
+# (microphone, camera, automation) across upgrades.
+codesign --force --sign "$identity" --identifier "$BUNDLE_ID" "$app"
+codesign --verify --strict "$app"
+
+echo "mjolnir-package: built $app $VERSION, signed by ${SIGN_IDENTITY:-ad hoc} ($(du -sh "$app" | cut -f1))"

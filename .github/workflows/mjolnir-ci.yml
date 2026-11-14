@@ -38,6 +38,8 @@ env:
 
 jobs:
   platform-tests:
+    # Fork-only: never runs in upstream or any other copy of this repo.
+    if: github.repository == 'jxu-dev-c/Mjolnir'
     strategy:
       fail-fast: false
       matrix:
@@ -137,7 +139,7 @@ jobs:
   # Keep the required check name stable while requiring every platform.
   test:
     needs: platform-tests
-    if: always()
+    if: always() && github.repository == 'jxu-dev-c/Mjolnir'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

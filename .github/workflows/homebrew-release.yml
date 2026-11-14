@@ -43,6 +43,8 @@ env:
 
 jobs:
   release:
+    # Fork-only: never runs in upstream or any other copy of this repo.
+    if: github.repository == 'jxu-dev-c/Mjolnir'
     runs-on: macos-15
     # Uncached: a tag's cache is visible only to that tag.
     timeout-minutes: 90

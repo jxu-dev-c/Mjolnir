@@ -1,0 +1,137 @@
+# Mjolnir release (this fork). Push a tag v<upstream version>-mjolnir.<n>,
+# e.g. v0.1.15-mjolnir.1, where <upstream version> is Cargo.toml's version.
+# After syncing a new upstream version, start again at -mjolnir.1.
+#
+# Builds Mjolnir.app (Apple Silicon) with scripts/mjolnir-package, signs it
+# with the self-signed "Mjolnir Release" identity, publishes a GitHub Release
+# and updates Casks/mjolnir.rb in jxu-dev-c/homebrew-tap:
+#
+#   brew install --cask jxu-dev-c/tap/mjolnir
+#
+# The build leaves HERDR_APP_RELEASE unset: with it the app would update
+# itself to upstream Herdr and report telemetry upstream. Homebrew updates it.
+#
+# Upstream's release.yml stays in the repo (clean upstream merges) but is
+# disabled in this fork's Actions settings: gh workflow disable release.yml
+#
+# Secrets:
+#   SIGNING_CERT_P12       base64 .p12 of "Mjolnir Release" (scripts/make-signing-cert.sh);
+#                          stable across releases so macOS permission grants survive upgrades
+#   SIGNING_CERT_PASSWORD  its export password
+#   HOMEBREW_TAP_TOKEN     fine-grained PAT with contents:write on jxu-dev-c/homebrew-tap
+name: homebrew release
+
+on:
+  push:
+    tags: ["v*-mjolnir.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.1.15-mjolnir.1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: homebrew-release
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  release:
+    runs-on: macos-15
+    # Uncached: a tag's cache is visible only to that tag.
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          submodules: true
+          persist-credentials: false
+
+      - name: Version from tag
+        run: |
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-mjolnir\.([0-9]+)$ ]] \
+            || { echo "tag must look like v0.1.15-mjolnir.1, got $TAG" >&2; exit 1; }
+          base="${BASH_REMATCH[1]}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [[ "$base" == "$cargo_version" ]] \
+            || { echo "tag $TAG is based on $base but Cargo.toml says $cargo_version" >&2; exit 1; }
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Import signing identity
+        env:
+          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(openssl rand -hex 16)"
+          echo "$SIGNING_CERT_P12" | base64 --decode > "$RUNNER_TEMP/id.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/id.p12" -k "$keychain" -P "$SIGNING_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kc_pass" "$keychain" >/dev/null
+          read -ra existing <<< "$(security list-keychains -d user | tr -d '"' | xargs)"
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          rm "$RUNNER_TEMP/id.p12"
+          security find-identity -p codesigning "$keychain" | grep -q '"Mjolnir Release"'
+
+      - name: Build app
+        env:
+          SIGN_IDENTITY: Mjolnir Release
+        run: |
+          scripts/mjolnir-package
+          archs="$(lipo -archs dist/Mjolnir.app/Contents/MacOS/Mjolnir)"
+          [[ "$archs" == arm64 ]] || { echo "expected an arm64 binary, got: $archs" >&2; exit 1; }
+          codesign -dvv dist/Mjolnir.app 2>&1 | grep -q '^Authority=Mjolnir Release$' \
+            || { echo "not signed by Mjolnir Release" >&2; codesign -dvv dist/Mjolnir.app; exit 1; }
+
+      - name: Package
+        run: |
+          zip="dist/Mjolnir-$VERSION.zip"
+          ditto -c -k --keepParent dist/Mjolnir.app "$zip"
+          echo "ZIP=$zip" >> "$GITHUB_ENV"
+          echo "SHA256=$(shasum -a 256 "$zip" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$ZIP" --title "Mjolnir $VERSION" --generate-notes -R "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/jxu-dev-c/homebrew-tap.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Casks"
+          scripts/render-cask.sh "$VERSION" "$SHA256" > "$RUNNER_TEMP/tap/Casks/mjolnir.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/mjolnir.rb
+          if git diff --cached --quiet; then echo "cask unchanged"; exit 0; fi
+          git commit -m "mjolnir $VERSION"
+          git push
+
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true

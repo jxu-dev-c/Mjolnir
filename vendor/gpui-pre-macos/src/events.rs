@@ -405,7 +405,14 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
             .to_string();
         let mut key_char = None;
         let mut unshifted_key = None;
-        let first_char = characters.chars().next().map(|ch| ch as u16);
+        // HERDR: only a single character names a key. Text expanders and voice
+        // input post several characters per event ("expo", " cla", " this"); one
+        // that starts with a space or a newline is text, not that key (#310).
+        let mut chars = characters.chars();
+        let first_char = chars
+            .next()
+            .filter(|_| chars.next().is_none())
+            .map(|ch| ch as u16);
         let modifiers = native_event.modifierFlags();
 
         let control = modifiers.contains(NSEventModifierFlags::NSControlKeyMask);
@@ -854,5 +861,24 @@ mod tests {
         set_option_as_alt(Some(OptionAsAlt::Both));
         assert_eq!(native_key_with_text(0x00, NSEventModifierFlags::NSAlternateKeyMask, "å").key_char, Some(own));
         set_option_as_alt(Some(OptionAsAlt::None));
+    }
+
+    #[test]
+    fn posted_characters_are_text_not_the_key_they_start_with() {
+        let _guard = NATIVE_KEY_TEST.lock().unwrap();
+        set_option_as_alt(Some(OptionAsAlt::None));
+        let none = NSEventModifierFlags::empty();
+        // Text expanders post snippets in chunks and voice input posts words,
+        // all on one key code; text input types them whole.
+        for text in [" cla", " this", "\tfoo", "\rnext", "\u{7f}x"] {
+            let keystroke = native_key_with_text(0x00, none, text);
+            assert_eq!(keystroke.key_char, None, "{text:?}");
+            assert_eq!(keystroke.key, translate_key(0x00, NO_MOD, true), "{text:?}");
+        }
+        // A single character still names its key.
+        for (code, text, key) in [(0x31, " ", "space"), (0x30, "\t", "tab"), (0x24, "\r", "enter"), (0x33, "\u{7f}", "backspace")] {
+            assert_eq!(native_key_with_text(code, none, text).key, key, "{text:?}");
+        }
+        assert_eq!(native_key_with_text(0x31, none, " ").key_char.as_deref(), Some(" "));
     }
 }
